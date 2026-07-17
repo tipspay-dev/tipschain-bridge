@@ -1,0 +1,90 @@
+// test/BridgeMessageBus.test.js
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
+
+describe("Bridge + MessageBusMock Integration", function () {
+  let Bridge, Registry, Token, Wrapped, MessageBus;
+  let bridgeSrc, bridgeDst, registrySrc, registryDst, messageBus;
+  let owner, validator, user;
+
+  beforeEach(async function () {
+    [owner, validator, user] = await ethers.getSigners();
+
+    // Deploy registries
+    const RegistryContract = await ethers.getContractFactory("TokenRegistry");
+    registrySrc = await RegistryContract.deploy();
+    registryDst = await RegistryContract.deploy();
+
+    // Deploy MessageBusMock
+    const MessageBusContract = await ethers.getContractFactory("MessageBusMock");
+    messageBus = await MessageBusContract.deploy();
+
+    // Deploy bridges
+    const BridgeContract = await ethers.getContractFactory("Bridge");
+    bridgeSrc = await BridgeContract.deploy();
+    await bridgeSrc.initialize(registrySrc.address, messageBus.address);
+
+    bridgeDst = await BridgeContract.deploy();
+    await bridgeDst.initialize(registryDst.address, messageBus.address);
+
+    // Deploy tokens
+    const TokenContract = await ethers.getContractFactory("WrappedToken");
+    Token = await TokenContract.deploy("MockToken", "MTK");
+    await Token.deployed();
+
+    Wrapped = await TokenContract.deploy("WrappedMock", "WMTK");
+    await Wrapped.deployed();
+
+    // Register tokens
+    const assetId = ethers.utils.formatBytes32String("MOCK_ASSET");
+    await registrySrc.register(assetId, Token.address);
+    await registryDst.register(assetId, Wrapped.address);
+
+    // Mint native tokens
+    await Token.mint(user.address, 1000);
+  });
+
+  it("deposit → release with MessageBus verification", async function () {
+    // User deposits
+    await Token.connect(user).approve(bridgeSrc.address, 500);
+    const tx = await bridgeSrc.connect(user).deposit(Token.address, 500, 1, user.address);
+    const receipt = await tx.wait();
+    const msgId = receipt.events.find(e => e.event === "Deposited").args.msgId;
+
+    // Validator delivers message
+    await messageBus.deliverMessage(msgId, "0x");
+
+    // Validator releases on destination chain
+    await bridgeDst.grantRole(await bridgeDst.VALIDATOR_ROLE(), validator.address);
+    const assetId = ethers.utils.formatBytes32String("MOCK_ASSET");
+    const payload = ethers.utils.defaultAbiCoder.encode(["address","uint256","address"], [Token.address, 500, user.address]);
+
+    await bridgeDst.connect(validator).release(assetId, 500, user.address, payload, "0x", await bridgeSrc.provider.getNetwork().then(n => n.chainId));
+
+    expect(await Wrapped.balanceOf(user.address)).to.equal(500);
+  });
+
+  it("burn → release with MessageBus verification", async function () {
+    const assetId = ethers.utils.formatBytes32String("MOCK_ASSET");
+
+    // Mint wrapped tokens to user
+    await Wrapped.mint(user.address, 500);
+
+    // User burns wrapped tokens
+    await Wrapped.connect(user).approve(bridgeDst.address, 500);
+    const tx = await bridgeDst.connect(user).burn(assetId, 500, 1, user.address);
+    const receipt = await tx.wait();
+    const msgId = receipt.events.find(e => e.event === "Burned").args.msgId;
+
+    // Validator delivers message
+    await messageBus.deliverMessage(msgId, "0x");
+
+    // Validator releases native tokens on source chain
+    await bridgeSrc.grantRole(await bridgeSrc.VALIDATOR_ROLE(), validator.address);
+    const payload = ethers.utils.defaultAbiCoder.encode(["bytes32","uint256","address"], [assetId, 500, user.address]);
+
+    await bridgeSrc.connect(validator).release(assetId, 500, user.address, payload, "0x", await bridgeDst.provider.getNetwork().then(n => n.chainId));
+
+    expect(await Token.balanceOf(user.address)).to.equal(1000 + 500); // original + released
+  });
+});
