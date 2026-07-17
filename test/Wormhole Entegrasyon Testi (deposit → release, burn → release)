@@ -1,0 +1,84 @@
+// test/BridgeWormhole.test.js
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
+
+describe("Bridge + WormholeMock Integration", function () {
+  let Bridge, Registry, Token, Wrapped, WormholeMock;
+  let bridgeSrc, bridgeDst, registrySrc, registryDst, wormhole;
+  let owner, validator, user;
+
+  beforeEach(async function () {
+    [owner, validator, user] = await ethers.getSigners();
+
+    // Deploy registries
+    const RegistryContract = await ethers.getContractFactory("TokenRegistry");
+    registrySrc = await RegistryContract.deploy();
+    registryDst = await RegistryContract.deploy();
+
+    // Deploy WormholeMock
+    const WormholeContract = await ethers.getContractFactory("WormholeMock");
+    wormhole = await WormholeContract.deploy();
+
+    // Deploy bridges
+    const BridgeContract = await ethers.getContractFactory("Bridge");
+    bridgeSrc = await BridgeContract.deploy();
+    await bridgeSrc.initialize(registrySrc.address, wormhole.address, 1);
+
+    bridgeDst = await BridgeContract.deploy();
+    await bridgeDst.initialize(registryDst.address, wormhole.address, 1);
+
+    // Deploy tokens
+    const TokenContract = await ethers.getContractFactory("WrappedToken");
+    Token = await TokenContract.deploy("MockToken", "MTK");
+    await Token.deployed();
+
+    Wrapped = await TokenContract.deploy("WrappedMock", "WMTK");
+    await Wrapped.deployed();
+
+    // Register tokens
+    const assetId = ethers.utils.formatBytes32String("MOCK_ASSET");
+    await registrySrc.register(assetId, Token.address);
+    await registryDst.register(assetId, Wrapped.address);
+
+    // Mint native tokens
+    await Token.mint(user.address, 1000);
+  });
+
+  it("deposit → release with Wormhole verification", async function () {
+    // User deposits
+    await Token.connect(user).approve(bridgeSrc.address, 500);
+    const tx = await bridgeSrc.connect(user).deposit(Token.address, 500, 1, user.address);
+    const receipt = await tx.wait();
+    const sequence = receipt.events.find(e => e.event === "Deposited").args.sequence;
+
+    // Validator releases on destination chain
+    await bridgeDst.grantRole(await bridgeDst.VALIDATOR_ROLE(), validator.address);
+    const encodedVM = ethers.utils.hexZeroPad(ethers.BigNumber.from(sequence).toHexString(), 32);
+
+    const assetId = ethers.utils.formatBytes32String("MOCK_ASSET");
+    await bridgeDst.connect(validator).release(assetId, 500, user.address, encodedVM);
+
+    expect(await Wrapped.balanceOf(user.address)).to.equal(500);
+  });
+
+  it("burn → release with Wormhole verification", async function () {
+    const assetId = ethers.utils.formatBytes32String("MOCK_ASSET");
+
+    // Mint wrapped tokens to user
+    await Wrapped.mint(user.address, 500);
+
+    // User burns wrapped tokens
+    await Wrapped.connect(user).approve(bridgeDst.address, 500);
+    const tx = await bridgeDst.connect(user).burn(assetId, 500, 1, user.address);
+    const receipt = await tx.wait();
+    const sequence = receipt.events.find(e => e.event === "Burned").args.sequence;
+
+    // Validator releases native tokens on source chain
+    await bridgeSrc.grantRole(await bridgeSrc.VALIDATOR_ROLE(), validator.address);
+    const encodedVM = ethers.utils.hexZeroPad(ethers.BigNumber.from(sequence).toHexString(), 32);
+
+    await bridgeSrc.connect(validator).release(assetId, 500, user.address, encodedVM);
+
+    expect(await Token.balanceOf(user.address)).to.equal(1000 + 500); // original + released
+  });
+});
