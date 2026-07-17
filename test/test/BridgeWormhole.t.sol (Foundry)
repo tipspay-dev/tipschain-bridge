@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "forge-std/Test.sol";
+import "../contracts/Bridge.sol";
+import "../contracts/WrappedToken.sol";
+import "../contracts/TokenRegistry.sol";
+import "../contracts/WormholeMock.sol";
+
+contract BridgeWormholeTest is Test {
+    Bridge bridgeSrc;
+    Bridge bridgeDst;
+    TokenRegistry registrySrc;
+    TokenRegistry registryDst;
+    WrappedToken token;
+    WrappedToken wrapped;
+    WormholeMock wormhole;
+
+    address owner = address(0x1);
+    address validator = address(0x2);
+    address user = address(0x3);
+
+    bytes32 assetId = keccak256("MOCK_ASSET");
+
+    function setUp() public {
+        vm.startPrank(owner);
+
+        registrySrc = new TokenRegistry();
+        registryDst = new TokenRegistry();
+        wormhole = new WormholeMock();
+
+        bridgeSrc = new Bridge();
+        bridgeSrc.initialize(address(registrySrc), address(wormhole), 1);
+
+        bridgeDst = new Bridge();
+        bridgeDst.initialize(address(registryDst), address(wormhole), 1);
+
+        token = new WrappedToken();
+        token.initialize("MockToken", "MTK");
+
+        wrapped = new WrappedToken();
+        wrapped.initialize("WrappedMock", "WMTK");
+
+        registrySrc.register(assetId, address(token));
+        registryDst.register(assetId, address(wrapped));
+
+        token.mint(user, 1000);
+
+        vm.stopPrank();
+    }
+
+    function testDepositRelease() public {
+        vm.startPrank(user);
+        token.approve(address(bridgeSrc), 500);
+        bridgeSrc.deposit(address(token), 500, 1, user);
+        vm.stopPrank();
+
+        // Sequence ID 1
+        bytes memory encodedVM = abi.encode(uint64(1));
+
+        vm.startPrank(owner);
+        bridgeDst.grantRole(bridgeDst.VALIDATOR_ROLE(), validator);
+        vm.stopPrank();
+
+        vm.startPrank(validator);
+        bridgeDst.release(assetId, 500, user, encodedVM);
+        vm.stopPrank();
+
+        assertEq(wrapped.balanceOf(user), 500);
+    }
+
+    function testBurnRelease() public {
+        vm.startPrank(owner);
+        wrapped.mint(user, 500);
+        vm.stopPrank();
+
+        vm.startPrank(user);
+        wrapped.approve(address(bridgeDst), 500);
+        bridgeDst.burn(assetId, 500, 1, user);
+        vm.stopPrank();
+
+        // Sequence ID 2
+        bytes memory encodedVM = abi.encode(uint64(2));
+
+        vm.startPrank(owner);
+        bridgeSrc.grantRole(bridgeSrc.VALIDATOR_ROLE(), validator);
+        vm.stopPrank();
+
+        vm.startPrank(validator);
+        bridgeSrc.release(assetId, 500, user, encodedVM);
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(user), 1500); // 1000 original + 500 released
+    }
+}
