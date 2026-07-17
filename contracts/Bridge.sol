@@ -5,76 +5,57 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./ITokenRegistry.sol";
-import "./IMessageBus.sol";
+import "./IWormhole.sol";
 
 contract Bridge is UUPSUpgradeable, AccessControlUpgradeable {
     bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
 
     ITokenRegistry public registry;
-    IMessageBus public messageBus;
+    IWormhole public wormhole;
+    uint8 public consistencyLevel;
 
-    event Deposited(address indexed token, uint256 amount, uint256 targetChainId, address recipient, bytes32 msgId);
-    event Released(bytes32 indexed assetId, uint256 amount, address recipient, bytes32 msgId);
-    event Burned(bytes32 indexed assetId, uint256 amount, address recipient, bytes32 msgId);
+    event Deposited(address indexed token, uint256 amount, uint256 targetChainId, address recipient, uint64 sequence);
+    event Released(bytes32 indexed assetId, uint256 amount, address recipient, uint64 sequence);
+    event Burned(bytes32 indexed assetId, uint256 amount, address recipient, uint64 sequence);
 
-    function initialize(address _registry, address _messageBus) public initializer {
+    function initialize(address _registry, address _wormhole, uint8 _consistencyLevel) public initializer {
         __UUPSUpgradeable_init();
         __AccessControl_init();
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         registry = ITokenRegistry(_registry);
-        messageBus = IMessageBus(_messageBus);
+        wormhole = IWormhole(_wormhole);
+        consistencyLevel = _consistencyLevel;
     }
 
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 
-    function deposit(
-        address token,
-        uint256 amount,
-        uint256 targetChainId,
-        address recipient
-    ) external {
+    function deposit(address token, uint256 amount, uint256 targetChainId, address recipient) external payable {
         IERC20(token).transferFrom(msg.sender, address(this), amount);
-
-        bytes memory payload = abi.encode(token, amount, recipient);
-        bytes32 msgId = messageBus.sendMessage(targetChainId, recipient, payload);
-
-        emit Deposited(token, amount, targetChainId, recipient, msgId);
+        bytes memory payload = abi.encode(token, amount, recipient, targetChainId);
+        uint64 sequence = wormhole.publishMessage(0, payload, consistencyLevel);
+        emit Deposited(token, amount, targetChainId, recipient, sequence);
     }
 
-    function release(
-        bytes32 assetId,
-        uint256 amount,
-        address recipient,
-        bytes calldata payload,
-        bytes calldata signature,
-        uint256 srcChainId
-    ) external onlyRole(VALIDATOR_ROLE) {
-        bytes32 msgId = keccak256(payload);
-
-        require(
-            messageBus.verifyMessage(msgId, srcChainId, block.chainid, recipient, payload, signature),
-            "Invalid cross-chain message"
-        );
+    function release(bytes32 assetId, uint256 amount, address recipient, bytes calldata encodedVM)
+        external
+        onlyRole(VALIDATOR_ROLE)
+    {
+        (bool valid, ) = wormhole.verifyVM(encodedVM);
+        require(valid, "Invalid Wormhole message");
 
         address wrapped = registry.getWrapped(assetId);
         IERC20(wrapped).transfer(recipient, amount);
 
-        emit Released(assetId, amount, recipient, msgId);
+        emit Released(assetId, amount, recipient, 0);
     }
 
-    function burn(
-        bytes32 assetId,
-        uint256 amount,
-        uint256 targetChainId,
-        address recipient
-    ) external {
+    function burn(bytes32 assetId, uint256 amount, uint256 targetChainId, address recipient) external payable {
         address wrapped = registry.getWrapped(assetId);
         IERC20(wrapped).transferFrom(msg.sender, address(this), amount);
-        // wrapped token burn fonksiyonu çağrılmalı (mintable/burnable interface ile)
+        // wrapped token burn fonksiyonu çağrılmalı
 
-        bytes memory payload = abi.encode(assetId, amount, recipient);
-        bytes32 msgId = messageBus.sendMessage(targetChainId, recipient, payload);
-
-        emit Burned(assetId, amount, recipient, msgId);
+        bytes memory payload = abi.encode(assetId, amount, recipient, targetChainId);
+        uint64 sequence = wormhole.publishMessage(0, payload, consistencyLevel);
+        emit Burned(assetId, amount, recipient, sequence);
     }
 }
